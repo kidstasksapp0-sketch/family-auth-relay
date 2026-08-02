@@ -84,9 +84,9 @@
 
   log("page-load-start");
 
-  // مفتاح تخزين مؤقت (sessionStorage) لحفظ query parameters الحالية قبل استدعاء
-  // signInWithRedirect — لأن الصفحة تُعاد تحميلها بالكامل بعد العودة من Google، وقد لا تكون
-  // هذه القيم موجودة في الـ URL عند العودة، فنستعيدها من هنا كخط دفاع احتياطي.
+  // مفتاح تخزين مؤقت (sessionStorage) لحفظ query parameters الحالية — يُستخدم فقط إن سقطنا
+  // لمسار signInWithRedirect الاحتياطي (نادر: فقط عند حظر النافذة المنبثقة)، لأن ذلك المسار
+  // يُعيد تحميل الصفحة بالكامل بعد العودة من Google وقد لا تبقى هذه القيم في الـ URL.
   var SESSION_KEY = "ktapp_auth_relay_params_v1";
 
   var scheme = getParam("scheme");
@@ -170,18 +170,40 @@
     // في متصفح الجهاز (مثلاً حساب أحد الوالدين) دون تدخل واعٍ من المستخدم الحالي.
     provider.setCustomParameters({ prompt: "select_account" });
 
-    // نحفظ query parameters الحالية صراحة قبل التنقل الكامل بعيدًا عن هذه الصفحة،
-    // كي نستعيدها عند العودة إن لم تعد موجودة في الـ URL لأي سبب.
+    // نحفظ query parameters الحالية احتياطًا (تُستخدم فقط إن سقطنا لمسار signInWithRedirect
+    // الاحتياطي أدناه، والذي يحتاج إعادة تحميل كاملة للصفحة).
     try {
       sessionStorage.setItem(SESSION_KEY, JSON.stringify({ scheme: scheme, host: host, cfg: cfgB64 }));
     } catch (e) {}
 
-    log("sign-in-redirect-start");
-    // signInWithRedirect بدل signInWithPopup: التنقل الكامل يحدث ضمن نفس علامة التبويب
-    // (بلا نافذة منبثقة منفصلة)، وهذا يتفادى مشكلة عزل التخزين (storage partitioning)
-    // بين الصفحة والنافذة المنبثقة داخل بيئة Chrome Custom Tab.
-    auth.signInWithRedirect(provider).catch(function (error) {
-      log("sign-in-redirect-immediate-error", error && error.message);
+    // ---- إصلاح جوهري (v1.6.8): signInWithPopup بدل signInWithRedirect كمسار أساسي ----
+    // v1.6.7 حلّت مشكلة فتح الصفحة داخل WebView/Custom Tab بفتحها في متصفح نظام خارجي حقيقي
+    // ومستقل تمامًا. لكن signInWithRedirect يبقى معطوبًا حتى داخل متصفح حقيقي، لأن نجاحه يعتمد
+    // على تواصل خفي بين نطاق هذه الصفحة (GitHub Pages) ونطاق Firebase الوسيط (authDomain) عبر
+    // iframe/تخزين مشترك بين نطاقين مختلفين — وهذا بالضبط ما تمنعه متصفحات Chrome الحديثة
+    // (Storage Partitioning) بغضّ النظر عن نوع المتصفح المُستضيف. النتيجة الملحوظة: يتم تأكيد
+    // الحساب فعليًا عند Google، لكن الصفحة تعود لحالة "سجّل دخولك" الأولية دون أي نتيجة لأن
+    // getRedirectResult() يرجع فارغًا، فلا يحدث أي عودة (Deep Link) للتطبيق إطلاقًا.
+    // الحل: signInWithPopup يتواصل بين نافذتين داخل *نفس* جلسة المتصفح عبر postMessage —
+    // آلية مصممة أصلًا للعمل بين نطاقين مختلفين ولا تتأثر بعزل التخزين إطلاقًا، ولا تحتاج أي
+    // إعادة تحميل كاملة لهذه الصفحة. الآن بما أننا داخل متصفح نظام حقيقي مستقل (وليس WebView)
+    // فالنوافذ المنبثقة تعمل بلا قيود، ولا يوجد أي سبب متبقٍ لتفضيل الـ redirect.
+    log("sign-in-popup-start");
+    auth.signInWithPopup(provider).then(function (result) {
+      log("sign-in-popup-success");
+      handleSignInSuccess(result);
+    }).catch(function (error) {
+      var code = error && error.code;
+      log("sign-in-popup-error", code || (error && error.message));
+      // fallback احتياطي فقط: إن مُنعت النافذة المنبثقة تحديدًا (نادر داخل متصفح حقيقي)
+      if (code === "auth/popup-blocked" || code === "auth/operation-not-supported-in-this-environment" || code === "auth/cancelled-popup-request") {
+        log("sign-in-popup-blocked-fallback-redirect");
+        auth.signInWithRedirect(provider).catch(function (redirectError) {
+          log("sign-in-redirect-immediate-error", redirectError && redirectError.message);
+          handleSignInError(redirectError);
+        });
+        return;
+      }
       handleSignInError(error);
     });
   }
