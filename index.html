@@ -45,12 +45,28 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script>
 (function () {
+  function log(msg, extra) {
+    try { console.log("[auth-relay] " + msg, extra !== undefined ? extra : ""); } catch (e) {}
+  }
+
   function showError(msg) {
     document.getElementById("loadingState").classList.add("hidden");
     document.getElementById("readyState").classList.add("hidden");
     document.getElementById("successState").classList.add("hidden");
     document.getElementById("errorState").classList.remove("hidden");
     document.getElementById("errMsg").textContent = msg;
+  }
+  function showLoading() {
+    document.getElementById("errorState").classList.add("hidden");
+    document.getElementById("readyState").classList.add("hidden");
+    document.getElementById("successState").classList.add("hidden");
+    document.getElementById("loadingState").classList.remove("hidden");
+  }
+  function showReady() {
+    document.getElementById("loadingState").classList.add("hidden");
+    document.getElementById("errorState").classList.add("hidden");
+    document.getElementById("successState").classList.add("hidden");
+    document.getElementById("readyState").classList.remove("hidden");
   }
 
   function getParam(name) {
@@ -66,9 +82,29 @@
     return url + (qs ? "?" + qs : "");
   }
 
+  log("page-load-start");
+
+  // مفتاح تخزين مؤقت (sessionStorage) لحفظ query parameters الحالية قبل استدعاء
+  // signInWithRedirect — لأن الصفحة تُعاد تحميلها بالكامل بعد العودة من Google، وقد لا تكون
+  // هذه القيم موجودة في الـ URL عند العودة، فنستعيدها من هنا كخط دفاع احتياطي.
+  var SESSION_KEY = "ktapp_auth_relay_params_v1";
+
   var scheme = getParam("scheme");
   var host = getParam("host") || "auth-callback";
   var cfgB64 = getParam("cfg");
+
+  if (!scheme || !cfgB64) {
+    try {
+      var savedRaw = sessionStorage.getItem(SESSION_KEY);
+      if (savedRaw) {
+        var saved = JSON.parse(savedRaw);
+        scheme = scheme || saved.scheme;
+        host = getParam("host") || saved.host || host;
+        cfgB64 = cfgB64 || saved.cfg;
+        log("restored-params-from-sessionStorage");
+      }
+    } catch (e) {}
+  }
 
   if (!scheme || !cfgB64) {
     showError("رابط غير صالح — يجب فتح هذه الصفحة من داخل تطبيق نجوم الأسرة فقط.");
@@ -94,6 +130,29 @@
   var app = firebase.apps[firebase.apps.length - 1];
   var auth = app.auth();
 
+  // ---- نجاح تسجيل الدخول: يُستخدم لكل من مسار العودة من Redirect ----
+  function handleSignInSuccess(result) {
+    var credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
+    var idToken = credential && credential.idToken;
+    if (!idToken) { showError("لم يصل رمز الدخول من جوجل — حاول مجددًا."); return; }
+    try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
+    returnUrl = buildReturnUrl(scheme, host, { idToken: idToken });
+    document.getElementById("loadingState").classList.add("hidden");
+    document.getElementById("successState").classList.remove("hidden");
+    // محاولة تلقائية للعودة فور النجاح، مع إبقاء الزر اليدوي كبديل مضمون
+    setTimeout(function () { window.location.href = returnUrl; }, 400);
+  }
+
+  // ---- فشل تسجيل الدخول: نفس تصنيف الرسائل المستخدم سابقًا في مسار Popup ----
+  function handleSignInError(error) {
+    var msg = (error && error.message) || String(error);
+    if (error && error.code === "auth/popup-closed-by-user") { msg = "تم إغلاق نافذة اختيار الحساب قبل إكمالها."; }
+    try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
+    var errReturnUrl = buildReturnUrl(scheme, host, { error: msg });
+    showError(msg);
+    setTimeout(function () { window.location.href = errReturnUrl; }, 1500);
+  }
+
   function doSignIn() {
     document.getElementById("readyState").classList.add("hidden");
     document.getElementById("loadingState").classList.remove("hidden");
@@ -103,21 +162,19 @@
     // في متصفح الجهاز (مثلاً حساب أحد الوالدين) دون تدخل واعٍ من المستخدم الحالي.
     provider.setCustomParameters({ prompt: "select_account" });
 
-    auth.signInWithPopup(provider).then(function (result) {
-      var credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
-      var idToken = credential && credential.idToken;
-      if (!idToken) { showError("لم يصل رمز الدخول من جوجل — حاول مجددًا."); return; }
-      returnUrl = buildReturnUrl(scheme, host, { idToken: idToken });
-      document.getElementById("loadingState").classList.add("hidden");
-      document.getElementById("successState").classList.remove("hidden");
-      // محاولة تلقائية للعودة فور النجاح، مع إبقاء الزر اليدوي كبديل مضمون
-      setTimeout(function () { window.location.href = returnUrl; }, 400);
-    }).catch(function (error) {
-      var msg = (error && error.message) || String(error);
-      if (error && error.code === "auth/popup-closed-by-user") { msg = "تم إغلاق نافذة اختيار الحساب قبل إكمالها."; }
-      var errReturnUrl = buildReturnUrl(scheme, host, { error: msg });
-      showError(msg);
-      setTimeout(function () { window.location.href = errReturnUrl; }, 1500);
+    // نحفظ query parameters الحالية صراحة قبل التنقل الكامل بعيدًا عن هذه الصفحة،
+    // كي نستعيدها عند العودة إن لم تعد موجودة في الـ URL لأي سبب.
+    try {
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify({ scheme: scheme, host: host, cfg: cfgB64 }));
+    } catch (e) {}
+
+    log("sign-in-redirect-start");
+    // signInWithRedirect بدل signInWithPopup: التنقل الكامل يحدث ضمن نفس علامة التبويب
+    // (بلا نافذة منبثقة منفصلة)، وهذا يتفادى مشكلة عزل التخزين (storage partitioning)
+    // بين الصفحة والنافذة المنبثقة داخل بيئة Chrome Custom Tab.
+    auth.signInWithRedirect(provider).catch(function (error) {
+      log("sign-in-redirect-immediate-error", error && error.message);
+      handleSignInError(error);
     });
   }
 
@@ -126,8 +183,23 @@
     if (returnUrl) window.location.href = returnUrl;
   });
 
-  document.getElementById("loadingState").classList.add("hidden");
-  document.getElementById("readyState").classList.remove("hidden");
+  // ---- التحقق من نتيجة عودة من إعادة توجيه Google قبل عرض أي حالة نهائية ----
+  // نعرض loadingState أثناء الانتظار (سواء كان هذا أول تحميل عادي أو عودة فعلية من Google)
+  // لتفادي وميض الواجهة (flash) بين الحالتين قبل معرفة أيّهما فعليًا.
+  showLoading();
+  auth.getRedirectResult().then(function (result) {
+    log("redirect-result-received", { hasUser: !!(result && result.user) });
+    if (result && result.user) {
+      handleSignInSuccess(result);
+    } else {
+      // لا توجد نتيجة عودة — هذا أول تحميل عادي للصفحة، نعرض زر الدخول كالمعتاد
+      log("redirect-result-empty-showing-ready");
+      showReady();
+    }
+  }).catch(function (error) {
+    log("redirect-result-error", error && error.message);
+    handleSignInError(error);
+  });
 })();
 </script>
 </body>
