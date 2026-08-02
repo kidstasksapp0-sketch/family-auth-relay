@@ -121,7 +121,15 @@
 
   var returnUrl = null;
   try {
-    firebase.initializeApp(firebaseConfig, "auth-relay-" + Date.now());
+    // ---- إصلاح جوهري: استخدام تطبيق Firebase الافتراضي بلا اسم مخصص متغيّر ----
+    // الكود السابق كان يستخدم firebase.initializeApp(firebaseConfig, "auth-relay-" + Date.now())
+    // وهذا يُنتج اسم تطبيق مختلف في كل تحميل للصفحة. بما أن signInWithRedirect يحفظ حالة
+    // "الطلب المعلّق" في IndexedDB بمفتاح يتضمن اسم التطبيق، فإن الصفحة بعد العودة من Google
+    // (وهي تحميل كامل جديد للصفحة) كانت تُنشئ اسمًا جديدًا مختلفًا عن الاسم الذي بدأ الطلب،
+    // فيفشل getRedirectResult() في العثور على أي نتيجة رغم نجاح الدخول الفعلي في Google.
+    // الحل: عدم تمرير اسم مخصص إطلاقًا (استخدام التطبيق الافتراضي "[DEFAULT]")، وهو ثابت
+    // دائمًا بين تحميلات الصفحة المختلفة، فيتطابق اسم البداية مع اسم العودة دومًا.
+    firebase.initializeApp(firebaseConfig);
   } catch (e) {
     showError("تعذّر الاتصال بإعدادات هذه العائلة: " + (e && e.message ? e.message : String(e)));
     return;
