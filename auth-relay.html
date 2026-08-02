@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>تسجيل الدخول — نجوم الأسرة</title>
+<style>
+  body { font-family: 'Tajawal', 'Segoe UI', sans-serif; background: #FBF7EF; margin: 0; padding: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .box { max-width: 380px; width: 90%; background: white; border-radius: 24px; padding: 32px 24px; text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
+  .spinner { width: 36px; height: 36px; border: 4px solid #E2E8F0; border-top-color: #3E9C86; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 20px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  h1 { font-size: 18px; color: #1E293B; margin: 0 0 8px; }
+  p { font-size: 13px; color: #64748B; line-height: 1.8; margin: 0 0 20px; }
+  .btn { display: inline-block; background: #3E9C86; color: white; font-weight: 800; font-size: 14px; padding: 14px 28px; border-radius: 16px; text-decoration: none; border: none; cursor: pointer; }
+  .err { background: #FDECEB; color: #B5423A; border-radius: 14px; padding: 14px; font-size: 12px; line-height: 1.8; margin-bottom: 16px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="box">
+  <div id="loadingState">
+    <div class="spinner"></div>
+    <h1>جارِ تجهيز تسجيل الدخول...</h1>
+    <p>الرجاء الانتظار قليلاً</p>
+  </div>
+  <div id="errorState" class="hidden">
+    <div class="err" id="errMsg"></div>
+    <button class="btn" onclick="location.reload()">إعادة المحاولة</button>
+  </div>
+  <div id="readyState" class="hidden">
+    <h1>سجّل دخولك للمتابعة</h1>
+    <p>سيُطلب منك اختيار حساب Google الخاص بك دائمًا لضمان الأمان.</p>
+    <button class="btn" id="signInBtn">الدخول بحساب Google</button>
+  </div>
+  <div id="successState" class="hidden">
+    <div class="spinner"></div>
+    <h1>تم تسجيل الدخول بنجاح ✓</h1>
+    <p>اضغط الزر أدناه للعودة إلى التطبيق (بعض الأجهزة تحتاج ضغطة يدوية لأسباب أمنية في المتصفح)</p>
+    <button class="btn" id="returnBtn">المتابعة إلى التطبيق</button>
+  </div>
+</div>
+
+<!-- Firebase compat SDKs — نفس الإصدار المستخدم داخل التطبيق نفسه لضمان التوافق -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script>
+(function () {
+  function showError(msg) {
+    document.getElementById("loadingState").classList.add("hidden");
+    document.getElementById("readyState").classList.add("hidden");
+    document.getElementById("successState").classList.add("hidden");
+    document.getElementById("errorState").classList.remove("hidden");
+    document.getElementById("errMsg").textContent = msg;
+  }
+
+  function getParam(name) {
+    var params = new URLSearchParams(window.location.search);
+    return params.get(name);
+  }
+
+  function buildReturnUrl(scheme, host, extraParams) {
+    var url = scheme + "://" + host;
+    var qs = Object.keys(extraParams).map(function (k) {
+      return encodeURIComponent(k) + "=" + encodeURIComponent(extraParams[k]);
+    }).join("&");
+    return url + (qs ? "?" + qs : "");
+  }
+
+  var scheme = getParam("scheme");
+  var host = getParam("host") || "auth-callback";
+  var cfgB64 = getParam("cfg");
+
+  if (!scheme || !cfgB64) {
+    showError("رابط غير صالح — يجب فتح هذه الصفحة من داخل تطبيق نجوم الأسرة فقط.");
+    return;
+  }
+
+  var firebaseConfig;
+  try {
+    firebaseConfig = JSON.parse(decodeURIComponent(escape(atob(decodeURIComponent(cfgB64)))));
+  } catch (e) {
+    showError("تعذّر قراءة إعدادات العائلة من الرابط.");
+    return;
+  }
+
+  var returnUrl = null;
+  try {
+    firebase.initializeApp(firebaseConfig, "auth-relay-" + Date.now());
+  } catch (e) {
+    showError("تعذّر الاتصال بإعدادات هذه العائلة: " + (e && e.message ? e.message : String(e)));
+    return;
+  }
+
+  var app = firebase.apps[firebase.apps.length - 1];
+  var auth = app.auth();
+
+  function doSignIn() {
+    document.getElementById("readyState").classList.add("hidden");
+    document.getElementById("loadingState").classList.remove("hidden");
+
+    var provider = new firebase.auth.GoogleAuthProvider();
+    // إلزامي أمنيًا: إجبار اختيار الحساب دائمًا — يمنع أي دخول صامت بحساب محفوظ مسبقًا
+    // في متصفح الجهاز (مثلاً حساب أحد الوالدين) دون تدخل واعٍ من المستخدم الحالي.
+    provider.setCustomParameters({ prompt: "select_account" });
+
+    auth.signInWithPopup(provider).then(function (result) {
+      var credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
+      var idToken = credential && credential.idToken;
+      if (!idToken) { showError("لم يصل رمز الدخول من جوجل — حاول مجددًا."); return; }
+      returnUrl = buildReturnUrl(scheme, host, { idToken: idToken });
+      document.getElementById("loadingState").classList.add("hidden");
+      document.getElementById("successState").classList.remove("hidden");
+      // محاولة تلقائية للعودة فور النجاح، مع إبقاء الزر اليدوي كبديل مضمون
+      setTimeout(function () { window.location.href = returnUrl; }, 400);
+    }).catch(function (error) {
+      var msg = (error && error.message) || String(error);
+      if (error && error.code === "auth/popup-closed-by-user") { msg = "تم إغلاق نافذة اختيار الحساب قبل إكمالها."; }
+      var errReturnUrl = buildReturnUrl(scheme, host, { error: msg });
+      showError(msg);
+      setTimeout(function () { window.location.href = errReturnUrl; }, 1500);
+    });
+  }
+
+  document.getElementById("signInBtn").addEventListener("click", doSignIn);
+  document.getElementById("returnBtn").addEventListener("click", function () {
+    if (returnUrl) window.location.href = returnUrl;
+  });
+
+  document.getElementById("loadingState").classList.add("hidden");
+  document.getElementById("readyState").classList.remove("hidden");
+})();
+</script>
+</body>
+</html>
