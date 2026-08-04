@@ -139,12 +139,31 @@
   var auth = app.auth();
 
   // ---- نجاح تسجيل الدخول: يُستخدم لكل من مسار العودة من Redirect ----
+  // ---- إصلاح جوهري (v1.6.9): لا نعتمد على credential.idToken وحده ----
+  // السبب الجذري الحقيقي لرسالة "لم يصل رمز الدخول من جوجل": توثيق Firebase الرسمي
+  // (وتأكيد مهندسي Firebase على GitHub) يوضح أن UserCredential الناتج عن signInWithPopup
+  // قد يكون بلا OAuthCredential فعلي (فيُصبح idToken و accessToken كلاهما null) رغم أن
+  // result.user موجود وصحيح — يحدث هذا تحديدًا حين لا يتغيّر فعليًا "المستخدم الحالي"
+  // لتطبيق Firebase (مثلاً لو كانت هناك جلسة محفوظة سابقًا على نطاق هذه الصفحة نفسها
+  // لنفس حساب Google الذي اختاره المستخدم للتو) — عندها لا يُنشئ Firebase بيانات اعتماد
+  // جديدة لأنه يعتبر العملية "بلا تغيير حقيقي". الحل الجذري (رصد وقت التحميل، أدناه) هو
+  // ضمان تسجيل خروج نظيف قبل عرض الزر أصلاً. هنا، كخط دفاع ثانٍ إضافي، نلتقط accessToken
+  // أيضًا (وليس idToken فقط) لأن Firebase يقبل رسميًا إعادة بناء بيانات الاعتماد من
+  // accessToken وحده عبر GoogleAuthProvider.credential(idToken, accessToken) — فإن غاب
+  // أحدهما لأي سبب آخر تبقى العملية قابلة للإكمال بالآخر.
   function handleSignInSuccess(result) {
     var credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
-    var idToken = credential && credential.idToken;
-    if (!idToken) { showError("لم يصل رمز الدخول من جوجل — حاول مجددًا."); return; }
+    var idToken = (credential && credential.idToken) || "";
+    var accessToken = (credential && credential.accessToken) || "";
+    log("credential-tokens-extracted", { hasIdToken: !!idToken, hasAccessToken: !!accessToken, email: result && result.user && result.user.email });
+    if (!idToken && !accessToken) {
+      showError("لم يصل أي رمز دخول من جوجل رغم نجاح تسجيل الدخول (غالبًا بسبب جلسة سابقة على هذا المتصفح). اضغط \"إعادة المحاولة\" — سيتم تجهيز جلسة جديدة نظيفة تلقائيًا.");
+      // تنظيف الجلسة المحلية فورًا حتى تكون إعادة المحاولة (بعد إعادة تحميل الصفحة) نظيفة
+      auth.signOut().catch(function () {});
+      return;
+    }
     try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
-    returnUrl = buildReturnUrl(scheme, host, { idToken: idToken });
+    returnUrl = buildReturnUrl(scheme, host, { idToken: idToken, accessToken: accessToken });
     document.getElementById("loadingState").classList.add("hidden");
     document.getElementById("successState").classList.remove("hidden");
     // محاولة تلقائية للعودة فور النجاح، مع إبقاء الزر اليدوي كبديل مضمون
@@ -169,6 +188,9 @@
     // إلزامي أمنيًا: إجبار اختيار الحساب دائمًا — يمنع أي دخول صامت بحساب محفوظ مسبقًا
     // في متصفح الجهاز (مثلاً حساب أحد الوالدين) دون تدخل واعٍ من المستخدم الحالي.
     provider.setCustomParameters({ prompt: "select_account" });
+    // نطاقات صريحة (بدل الاعتماد على الافتراضي الضمني فقط) لضمان وصول claims البريد والاسم دائمًا
+    provider.addScope("email");
+    provider.addScope("profile");
 
     // نحفظ query parameters الحالية احتياطًا (تُستخدم فقط إن سقطنا لمسار signInWithRedirect
     // الاحتياطي أدناه، والذي يحتاج إعادة تحميل كاملة للصفحة).
@@ -221,11 +243,28 @@
     log("redirect-result-received", { hasUser: !!(result && result.user) });
     if (result && result.user) {
       handleSignInSuccess(result);
-    } else {
-      // لا توجد نتيجة عودة — هذا أول تحميل عادي للصفحة، نعرض زر الدخول كالمعتاد
+      return;
+    }
+    // لا توجد نتيجة عودة — هذا أول تحميل عادي للصفحة (أو إعادة محاولة بعد خطأ).
+    // ---- إصلاح جوهري (v1.6.9): تسجيل خروج استباقي هنا، عند التحميل، وليس عند الضغط ----
+    // هذا هو السبب الجذري الفعلي للعطل المُبلَّغ عنه: هذه الصفحة تستخدم تطبيق Firebase
+    // بالاسم الافتراضي الثابت (منذ 1.6.8) عمدًا، ما يعني أن جلسة تسجيل الدخول تبقى محفوظة
+    // على نطاق هذه الصفحة (GitHub Pages) بين مرات الفتح المختلفة. لو ضغط المستخدم "الدخول
+    // بحساب Google" واختار نفس الحساب الذي كان مسجَّلاً به من قبل على هذا النطاق تحديدًا،
+    // فإن Firebase لا يُنشئ بيانات اعتماد (Credential) جديدة لأنه يرى أن "لا تغيير فعلي"،
+    // فتنجح النافذة المنبثقة (result.user موجود) لكن بلا idToken ولا accessToken إطلاقًا —
+    // وهذا بالضبط ما يُنتج رسالة "لم يصل رمز الدخول من جوجل". الحل: نضمن جلسة نظيفة قبل
+    // عرض الزر أصلاً (هنا)، بدل تسجيل الخروج داخل معالج الضغط نفسه — لأن استدعاء async
+    // (await) قبل signInWithPopup داخل معالج الضغط قد يُفقد المتصفح اعتباره "استدعاءً
+    // مباشرًا ضمن تفاعل المستخدم" (خصوصًا Safari/iOS)، فيحظر النافذة المنبثقة ويُسقط
+    // دائمًا للمسار الاحتياطي (Redirect) المصاب أصلاً بمشكلة عزل التخزين بين النطاقين.
+    // بهذا الترتيب: signInWithPopup داخل doSignIn يبقى متزامنًا 100% مع نقرة الزر، وفي
+    // نفس الوقت مضمون أن كل محاولة تبدأ من جلسة فارغة تُنتج بيانات اعتماد كاملة دائمًا.
+    log("pre-emptive-signout-before-ready");
+    auth.signOut().catch(function (e) { log("pre-emptive-signout-error", e && e.message); }).then(function () {
       log("redirect-result-empty-showing-ready");
       showReady();
-    }
+    });
   }).catch(function (error) {
     log("redirect-result-error", error && error.message);
     handleSignInError(error);
