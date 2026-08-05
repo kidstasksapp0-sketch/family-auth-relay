@@ -14,6 +14,7 @@
   .btn { display: inline-block; background: #3E9C86; color: white; font-weight: 800; font-size: 14px; padding: 14px 28px; border-radius: 16px; text-decoration: none; border: none; cursor: pointer; }
   .err { background: #FDECEB; color: #B5423A; border-radius: 14px; padding: 14px; font-size: 12px; line-height: 1.8; margin-bottom: 16px; }
   .hidden { display: none; }
+  #gisButtonContainer { display: flex; justify-content: center; margin-top: 4px; min-height: 44px; }
 </style>
 </head>
 <body>
@@ -30,7 +31,7 @@
   <div id="readyState" class="hidden">
     <h1>سجّل دخولك للمتابعة</h1>
     <p>سيُطلب منك اختيار حساب Google الخاص بك دائمًا لضمان الأمان.</p>
-    <button class="btn" id="signInBtn">الدخول بحساب Google</button>
+    <div id="gisButtonContainer"></div>
   </div>
   <div id="successState" class="hidden">
     <div class="spinner"></div>
@@ -40,9 +41,35 @@
   </div>
 </div>
 
-<!-- Firebase compat SDKs — نفس الإصدار المستخدم داخل التطبيق نفسه لضمان التوافق -->
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<!-- ====================================================================================
+     إصلاح جوهري (v1.6.9 → إعادة تصميم كاملة): استبدال Firebase signInWithPopup/Redirect
+     بمكتبة Google Identity Services (GIS) الرسمية — accounts.google.com/gsi/client
+     ------------------------------------------------------------------------------------
+     التشخيص الفعلي بعد اختبار حقيقي على جهاز أندرويد: الإصلاح السابق (تسجيل خروج استباقي
+     قبل signInWithPopup) لم يحل المشكلة حتى في أول فتح للصفحة على متصفح جديد تمامًا (لا
+     يمكن أن تكون هناك "جلسة سابقة" فعلية) — ما يُبطل فرضية "الجلسة القديمة" ويؤكد أن
+     السبب أعمق: توثيق Firebase نفسه يحذّر صراحة أن signInWithPopup غير موثوق على متصفحات
+     الجوال (خصوصًا Android Chrome)، لأن نافذة الـ popup هناك تُفتح كتبويب منفصل تمامًا بلا
+     قناة postMessage/window.opener موثوقة بينها وبين الصفحة الأصلية، فتُغلق النافذة بعد
+     تأكيد الحساب دون أن تصل بيانات الاعتماد (Credential) للصفحة الأصلية أبدًا — بينما
+     signInWithRedirect (الذي كان الحل السابق قبل 1.6.8) يفشل لسبب مختلف تمامًا: تقسيم
+     التخزين (Storage Partitioning) بين نطاق هذه الصفحة (GitHub Pages) ونطاق Firebase
+     الوسيط (authDomain) عند إعادة تحميل الصفحة بعد العودة من Google.
+     كلا المسارين (Popup و Redirect) في Firebase JS SDK يمران عبر نفس آلية OAuth الداخلية
+     المعطوبة في هذا السياق. الحل الجذري: تجاوز Firebase Auth بالكامل لخطوة "الحصول على
+     هوية Google" واستخدام مكتبة Google Identity Services الرسمية مباشرة — وهي الطريقة التي
+     توصي بها Google نفسها حاليًا لكل تكاملات "Sign in with Google" الجديدة (خلَفت مكتبة
+     gapi/auth2 القديمة التي يعتمد عليها Firebase داخليًا). الزر المعروض هنا هو زر Google
+     الرسمي (google.accounts.id.renderButton) — وهذا مضمون من جوجل نفسها للعمل بشكل موثوق
+     على كل المتصفحات (سطح مكتب وجوال) دون أي اعتماد على popup/redirect مُدارة من Firebase.
+     النتيجة: JWT ID Token موقّع من جوجل مباشرة (response.credential) — مضمون الوجود دائمًا
+     عند نجاح العملية (لا يوجد سيناريو "نجاح بلا رمز" كما كان يحدث مع Firebase)، يُمرَّر عبر
+     رابط العودة (Deep Link) للتطبيق، الذي يبنى منه GoogleAuthProvider.credential(idToken)
+     ويكمل تسجيل الدخول الفعلي في Firebase الخاص بهذه العائلة كما كان تمامًا من قبل.
+     ⚠️ يتطلب هذا التصميم قيمة إضافية واحدة (Web Client ID) تُضاف عند إعداد كل عائلة، تُقرأ
+     من نفس شاشة تفعيل "Google" في Firebase Console (بدون أي خطوة خارج Firebase إطلاقًا).
+     ==================================================================================== -->
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 (function () {
   function log(msg, extra) {
@@ -82,193 +109,98 @@
     return url + (qs ? "?" + qs : "");
   }
 
-  log("page-load-start");
+  // فك تشفير حمولة JWT محليًا (بدون أي مكتبة) — للعرض فقط (البريد الإلكتروني)؛ التحقق
+  // الفعلي من صحة التوقيع يتم لاحقًا من طرف Firebase نفسه عند استدعاء signInWithCredential
+  // في التطبيق الرئيسي، فلا حاجة ولا فائدة أمنية من التحقق منه هنا.
+  function decodeJwtPayload(token) {
+    try {
+      var base64Url = token.split(".")[1];
+      var base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
+      var json = decodeURIComponent(atob(base64).split("").map(function (c) {
+        return "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2);
+      }).join(""));
+      return JSON.parse(json);
+    } catch (e) { return null; }
+  }
 
-  // مفتاح تخزين مؤقت (sessionStorage) لحفظ query parameters الحالية — يُستخدم فقط إن سقطنا
-  // لمسار signInWithRedirect الاحتياطي (نادر: فقط عند حظر النافذة المنبثقة)، لأن ذلك المسار
-  // يُعيد تحميل الصفحة بالكامل بعد العودة من Google وقد لا تبقى هذه القيم في الـ URL.
-  var SESSION_KEY = "ktapp_auth_relay_params_v1";
+  log("page-load-start");
 
   var scheme = getParam("scheme");
   var host = getParam("host") || "auth-callback";
-  var cfgB64 = getParam("cfg");
+  var clientId = getParam("cid");
 
-  if (!scheme || !cfgB64) {
-    try {
-      var savedRaw = sessionStorage.getItem(SESSION_KEY);
-      if (savedRaw) {
-        var saved = JSON.parse(savedRaw);
-        scheme = scheme || saved.scheme;
-        host = getParam("host") || saved.host || host;
-        cfgB64 = cfgB64 || saved.cfg;
-        log("restored-params-from-sessionStorage");
-      }
-    } catch (e) {}
-  }
-
-  if (!scheme || !cfgB64) {
-    showError("رابط غير صالح — يجب فتح هذه الصفحة من داخل تطبيق نجوم الأسرة فقط.");
-    return;
-  }
-
-  var firebaseConfig;
-  try {
-    firebaseConfig = JSON.parse(decodeURIComponent(escape(atob(decodeURIComponent(cfgB64)))));
-  } catch (e) {
-    showError("تعذّر قراءة إعدادات العائلة من الرابط.");
+  if (!scheme || !clientId) {
+    showError("رابط غير صالح أو ناقص — تأكد من إضافة \"Web Client ID\" الخاص بهذه العائلة في إعدادات التطبيق، ثم أعد المحاولة من داخل تطبيق نجوم الأسرة.");
     return;
   }
 
   var returnUrl = null;
-  try {
-    // ---- إصلاح جوهري: استخدام تطبيق Firebase الافتراضي بلا اسم مخصص متغيّر ----
-    // الكود السابق كان يستخدم firebase.initializeApp(firebaseConfig, "auth-relay-" + Date.now())
-    // وهذا يُنتج اسم تطبيق مختلف في كل تحميل للصفحة. بما أن signInWithRedirect يحفظ حالة
-    // "الطلب المعلّق" في IndexedDB بمفتاح يتضمن اسم التطبيق، فإن الصفحة بعد العودة من Google
-    // (وهي تحميل كامل جديد للصفحة) كانت تُنشئ اسمًا جديدًا مختلفًا عن الاسم الذي بدأ الطلب،
-    // فيفشل getRedirectResult() في العثور على أي نتيجة رغم نجاح الدخول الفعلي في Google.
-    // الحل: عدم تمرير اسم مخصص إطلاقًا (استخدام التطبيق الافتراضي "[DEFAULT]")، وهو ثابت
-    // دائمًا بين تحميلات الصفحة المختلفة، فيتطابق اسم البداية مع اسم العودة دومًا.
-    firebase.initializeApp(firebaseConfig);
-  } catch (e) {
-    showError("تعذّر الاتصال بإعدادات هذه العائلة: " + (e && e.message ? e.message : String(e)));
-    return;
-  }
 
-  var app = firebase.apps[firebase.apps.length - 1];
-  var auth = app.auth();
-
-  // ---- نجاح تسجيل الدخول: يُستخدم لكل من مسار العودة من Redirect ----
-  // ---- إصلاح جوهري (v1.6.9): لا نعتمد على credential.idToken وحده ----
-  // السبب الجذري الحقيقي لرسالة "لم يصل رمز الدخول من جوجل": توثيق Firebase الرسمي
-  // (وتأكيد مهندسي Firebase على GitHub) يوضح أن UserCredential الناتج عن signInWithPopup
-  // قد يكون بلا OAuthCredential فعلي (فيُصبح idToken و accessToken كلاهما null) رغم أن
-  // result.user موجود وصحيح — يحدث هذا تحديدًا حين لا يتغيّر فعليًا "المستخدم الحالي"
-  // لتطبيق Firebase (مثلاً لو كانت هناك جلسة محفوظة سابقًا على نطاق هذه الصفحة نفسها
-  // لنفس حساب Google الذي اختاره المستخدم للتو) — عندها لا يُنشئ Firebase بيانات اعتماد
-  // جديدة لأنه يعتبر العملية "بلا تغيير حقيقي". الحل الجذري (رصد وقت التحميل، أدناه) هو
-  // ضمان تسجيل خروج نظيف قبل عرض الزر أصلاً. هنا، كخط دفاع ثانٍ إضافي، نلتقط accessToken
-  // أيضًا (وليس idToken فقط) لأن Firebase يقبل رسميًا إعادة بناء بيانات الاعتماد من
-  // accessToken وحده عبر GoogleAuthProvider.credential(idToken, accessToken) — فإن غاب
-  // أحدهما لأي سبب آخر تبقى العملية قابلة للإكمال بالآخر.
-  function handleSignInSuccess(result) {
-    var credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
-    var idToken = (credential && credential.idToken) || "";
-    var accessToken = (credential && credential.accessToken) || "";
-    log("credential-tokens-extracted", { hasIdToken: !!idToken, hasAccessToken: !!accessToken, email: result && result.user && result.user.email });
-    if (!idToken && !accessToken) {
-      showError("لم يصل أي رمز دخول من جوجل رغم نجاح تسجيل الدخول (غالبًا بسبب جلسة سابقة على هذا المتصفح). اضغط \"إعادة المحاولة\" — سيتم تجهيز جلسة جديدة نظيفة تلقائيًا.");
-      // تنظيف الجلسة المحلية فورًا حتى تكون إعادة المحاولة (بعد إعادة تحميل الصفحة) نظيفة
-      auth.signOut().catch(function () {});
+  // ---- نجاح تسجيل الدخول: يستدعيها GIS مباشرة مع JWT ID Token موقّع من جوجل ----
+  // على عكس Firebase signInWithPopup/Redirect، لا يوجد هنا أي سيناريو "نجاح بلا رمز":
+  // GIS إما يستدعي هذه الدالة مع response.credential صالح، أو لا يستدعيها إطلاقًا.
+  function handleGisCredential(response) {
+    var idToken = response && response.credential;
+    if (!idToken) {
+      log("gis-credential-missing");
+      showError("لم يصل رمز الدخول من جوجل — حاول مجددًا.");
       return;
     }
-    try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
-    returnUrl = buildReturnUrl(scheme, host, { idToken: idToken, accessToken: accessToken });
+    var payload = decodeJwtPayload(idToken);
+    log("gis-credential-received", { email: payload && payload.email });
+    returnUrl = buildReturnUrl(scheme, host, { idToken: idToken });
     document.getElementById("loadingState").classList.add("hidden");
+    document.getElementById("readyState").classList.add("hidden");
     document.getElementById("successState").classList.remove("hidden");
     // محاولة تلقائية للعودة فور النجاح، مع إبقاء الزر اليدوي كبديل مضمون
     setTimeout(function () { window.location.href = returnUrl; }, 400);
   }
 
-  // ---- فشل تسجيل الدخول: نفس تصنيف الرسائل المستخدم سابقًا في مسار Popup ----
-  function handleSignInError(error) {
-    var msg = (error && error.message) || String(error);
-    if (error && error.code === "auth/popup-closed-by-user") { msg = "تم إغلاق نافذة اختيار الحساب قبل إكمالها."; }
-    try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
-    var errReturnUrl = buildReturnUrl(scheme, host, { error: msg });
-    showError(msg);
-    setTimeout(function () { window.location.href = errReturnUrl; }, 1500);
-  }
-
-  function doSignIn() {
-    document.getElementById("readyState").classList.add("hidden");
-    document.getElementById("loadingState").classList.remove("hidden");
-
-    var provider = new firebase.auth.GoogleAuthProvider();
-    // إلزامي أمنيًا: إجبار اختيار الحساب دائمًا — يمنع أي دخول صامت بحساب محفوظ مسبقًا
-    // في متصفح الجهاز (مثلاً حساب أحد الوالدين) دون تدخل واعٍ من المستخدم الحالي.
-    provider.setCustomParameters({ prompt: "select_account" });
-    // نطاقات صريحة (بدل الاعتماد على الافتراضي الضمني فقط) لضمان وصول claims البريد والاسم دائمًا
-    provider.addScope("email");
-    provider.addScope("profile");
-
-    // نحفظ query parameters الحالية احتياطًا (تُستخدم فقط إن سقطنا لمسار signInWithRedirect
-    // الاحتياطي أدناه، والذي يحتاج إعادة تحميل كاملة للصفحة).
-    try {
-      sessionStorage.setItem(SESSION_KEY, JSON.stringify({ scheme: scheme, host: host, cfg: cfgB64 }));
-    } catch (e) {}
-
-    // ---- إصلاح جوهري (v1.6.8): signInWithPopup بدل signInWithRedirect كمسار أساسي ----
-    // v1.6.7 حلّت مشكلة فتح الصفحة داخل WebView/Custom Tab بفتحها في متصفح نظام خارجي حقيقي
-    // ومستقل تمامًا. لكن signInWithRedirect يبقى معطوبًا حتى داخل متصفح حقيقي، لأن نجاحه يعتمد
-    // على تواصل خفي بين نطاق هذه الصفحة (GitHub Pages) ونطاق Firebase الوسيط (authDomain) عبر
-    // iframe/تخزين مشترك بين نطاقين مختلفين — وهذا بالضبط ما تمنعه متصفحات Chrome الحديثة
-    // (Storage Partitioning) بغضّ النظر عن نوع المتصفح المُستضيف. النتيجة الملحوظة: يتم تأكيد
-    // الحساب فعليًا عند Google، لكن الصفحة تعود لحالة "سجّل دخولك" الأولية دون أي نتيجة لأن
-    // getRedirectResult() يرجع فارغًا، فلا يحدث أي عودة (Deep Link) للتطبيق إطلاقًا.
-    // الحل: signInWithPopup يتواصل بين نافذتين داخل *نفس* جلسة المتصفح عبر postMessage —
-    // آلية مصممة أصلًا للعمل بين نطاقين مختلفين ولا تتأثر بعزل التخزين إطلاقًا، ولا تحتاج أي
-    // إعادة تحميل كاملة لهذه الصفحة. الآن بما أننا داخل متصفح نظام حقيقي مستقل (وليس WebView)
-    // فالنوافذ المنبثقة تعمل بلا قيود، ولا يوجد أي سبب متبقٍ لتفضيل الـ redirect.
-    log("sign-in-popup-start");
-    auth.signInWithPopup(provider).then(function (result) {
-      log("sign-in-popup-success");
-      handleSignInSuccess(result);
-    }).catch(function (error) {
-      var code = error && error.code;
-      log("sign-in-popup-error", code || (error && error.message));
-      // fallback احتياطي فقط: إن مُنعت النافذة المنبثقة تحديدًا (نادر داخل متصفح حقيقي)
-      if (code === "auth/popup-blocked" || code === "auth/operation-not-supported-in-this-environment" || code === "auth/cancelled-popup-request") {
-        log("sign-in-popup-blocked-fallback-redirect");
-        auth.signInWithRedirect(provider).catch(function (redirectError) {
-          log("sign-in-redirect-immediate-error", redirectError && redirectError.message);
-          handleSignInError(redirectError);
-        });
+  var gisWaitStart = Date.now();
+  function initGis() {
+    if (!window.google || !window.google.accounts || !window.google.accounts.id) {
+      // مكتبة GIS تُحمَّل عبر CDN خارجي؛ ننتظر تحميلها حتى 6 ثوانٍ قبل اعتبار الأمر فشلاً
+      // (قد يكون بطء الشبكة، أو حجب المكتبة من مانع إعلانات صارم على الجهاز)
+      if (Date.now() - gisWaitStart > 6000) {
+        log("gis-load-timeout");
+        showError("تعذّر تحميل مكتبة تسجيل الدخول من جوجل — تحقق من اتصال الإنترنت (وتعطيل أي مانع إعلانات إن وُجد) ثم أعد المحاولة.");
         return;
       }
-      handleSignInError(error);
-    });
+      setTimeout(initGis, 150);
+      return;
+    }
+    try {
+      google.accounts.id.initialize({
+        client_id: clientId,
+        callback: handleGisCredential,
+        auto_select: false,
+        cancel_on_tap_outside: true,
+        // itp_support: تحسين توافق مع متصفحات تفرض حماية تتبع صارمة (مثل Safari)
+        itp_support: true
+      });
+      // ملاحظة أمنية: نستخدم renderButton فقط (زر واضح يضغطه المستخدم بوعي) ولا نستخدم
+      // google.accounts.id.prompt() (One Tap)، لتفادي أي اختيار صامت تلقائي لحساب محفوظ
+      // مسبقًا على الجهاز (مثل حساب أحد الوالدين) دون تدخل واعٍ من المستخدم الحالي — بنفس
+      // مبدأ prompt:"select_account" الذي كان مطبّقًا سابقًا مع Firebase.
+      var container = document.getElementById("gisButtonContainer");
+      google.accounts.id.renderButton(container, {
+        type: "standard", theme: "filled_blue", size: "large",
+        text: "signin_with", shape: "pill", logo_alignment: "center", width: 280,
+      });
+      log("gis-initialized");
+      showReady();
+    } catch (e) {
+      log("gis-init-error", e && e.message);
+      showError("تعذّر تجهيز تسجيل الدخول من جوجل: " + ((e && e.message) || String(e)) + " — تأكد من صحة Web Client ID المُدخل في إعدادات التطبيق.");
+    }
   }
 
-  document.getElementById("signInBtn").addEventListener("click", doSignIn);
   document.getElementById("returnBtn").addEventListener("click", function () {
     if (returnUrl) window.location.href = returnUrl;
   });
 
-  // ---- التحقق من نتيجة عودة من إعادة توجيه Google قبل عرض أي حالة نهائية ----
-  // نعرض loadingState أثناء الانتظار (سواء كان هذا أول تحميل عادي أو عودة فعلية من Google)
-  // لتفادي وميض الواجهة (flash) بين الحالتين قبل معرفة أيّهما فعليًا.
   showLoading();
-  auth.getRedirectResult().then(function (result) {
-    log("redirect-result-received", { hasUser: !!(result && result.user) });
-    if (result && result.user) {
-      handleSignInSuccess(result);
-      return;
-    }
-    // لا توجد نتيجة عودة — هذا أول تحميل عادي للصفحة (أو إعادة محاولة بعد خطأ).
-    // ---- إصلاح جوهري (v1.6.9): تسجيل خروج استباقي هنا، عند التحميل، وليس عند الضغط ----
-    // هذا هو السبب الجذري الفعلي للعطل المُبلَّغ عنه: هذه الصفحة تستخدم تطبيق Firebase
-    // بالاسم الافتراضي الثابت (منذ 1.6.8) عمدًا، ما يعني أن جلسة تسجيل الدخول تبقى محفوظة
-    // على نطاق هذه الصفحة (GitHub Pages) بين مرات الفتح المختلفة. لو ضغط المستخدم "الدخول
-    // بحساب Google" واختار نفس الحساب الذي كان مسجَّلاً به من قبل على هذا النطاق تحديدًا،
-    // فإن Firebase لا يُنشئ بيانات اعتماد (Credential) جديدة لأنه يرى أن "لا تغيير فعلي"،
-    // فتنجح النافذة المنبثقة (result.user موجود) لكن بلا idToken ولا accessToken إطلاقًا —
-    // وهذا بالضبط ما يُنتج رسالة "لم يصل رمز الدخول من جوجل". الحل: نضمن جلسة نظيفة قبل
-    // عرض الزر أصلاً (هنا)، بدل تسجيل الخروج داخل معالج الضغط نفسه — لأن استدعاء async
-    // (await) قبل signInWithPopup داخل معالج الضغط قد يُفقد المتصفح اعتباره "استدعاءً
-    // مباشرًا ضمن تفاعل المستخدم" (خصوصًا Safari/iOS)، فيحظر النافذة المنبثقة ويُسقط
-    // دائمًا للمسار الاحتياطي (Redirect) المصاب أصلاً بمشكلة عزل التخزين بين النطاقين.
-    // بهذا الترتيب: signInWithPopup داخل doSignIn يبقى متزامنًا 100% مع نقرة الزر، وفي
-    // نفس الوقت مضمون أن كل محاولة تبدأ من جلسة فارغة تُنتج بيانات اعتماد كاملة دائمًا.
-    log("pre-emptive-signout-before-ready");
-    auth.signOut().catch(function (e) { log("pre-emptive-signout-error", e && e.message); }).then(function () {
-      log("redirect-result-empty-showing-ready");
-      showReady();
-    });
-  }).catch(function (error) {
-    log("redirect-result-error", error && error.message);
-    handleSignInError(error);
-  });
+  initGis();
 })();
 </script>
 </body>
